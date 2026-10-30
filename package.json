@@ -1,0 +1,39 @@
+{
+  "name": "pi-meguru",
+  "version": "0.1.0",
+  "description": "Topology / actions / guards for pi codemode scripts, with checkpoints, breakpoints and watchpoints.",
+  "license": "MPL-2.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-codemode": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/p1zz1cat0/pi-meguru.git"
+  },
+  "files": [
+    "index.ts",
+    "inject.mjs",
+    "runtime.js",
+    "skills/",
+    "example.js",
+    "README.zh-CN.md",
+    "LICENSE"
+  ]
+}
