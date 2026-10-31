@@ -1,58 +1,42 @@
 // Paste this script into codemode. The host must have Python 3.
 // Put sample files in .work/cat-post/inbox before the first call.
-// At the break, check parcels and change input.destinations if required.
+// At the pause, check parcels and change destinations if required.
 // Send the script again to continue. Delivery copies files and keeps the originals.
-const r = await flow("cat-post", {
-  input: {
-    inbox: ".work/cat-post/inbox",
-    destinations: {
-      pictures: ".work/cat-post/album",
-      documents: ".work/cat-post/bookshelf",
-      other: ".work/cat-post/treasure-box",
-    },
-  },
+const inbox = ".work/cat-post/inbox"
+const destinations = {
+  pictures: ".work/cat-post/album",
+  documents: ".work/cat-post/bookshelf",
+  other: ".work/cat-post/treasure-box",
+}
 
-  helpers: {
-    quote: value => "'" + String(value).replace(/'/g, "'\\''") + "'",
-    python: async (source, data) => {
-      const result = await tools.bash({
-        command: "python3 -c " + quote(source) + " " + quote(JSON.stringify(data)),
-      })
-      if (result.exit_code !== 0) throw new Error(result.output)
-      return JSON.parse(result.output)
-    },
-    category: name => {
-      const ext = name.toLowerCase().split(".").pop()
-      if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) return "pictures"
-      if (["pdf", "md", "txt", "docx"].includes(ext)) return "documents"
-      return "other"
-    },
-  },
+const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'"
+async function python(source, data) {
+  const result = await tools.bash({
+    command: "python3 -c " + quote(source) + " " + quote(JSON.stringify(data)),
+  })
+  if (result.exit_code !== 0) throw new Error(result.output)
+  return JSON.parse(result.output)
+}
+function category(name) {
+  const ext = name.toLowerCase().split(".").pop()
+  if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) return "pictures"
+  if (["pdf", "md", "txt", "docx"].includes(ext)) return "documents"
+  return "other"
+}
 
-  // Declare the possible routes. Only one branch runs.
-  graph: {
-    peek: ["sort"],
-    sort: ["nap", "deliver"],
-    nap: ["receipt"],
-    deliver: ["receipt"],
-    receipt: [],
-  },
-
-  actions: {
-    peek: ({ input }) => python(`
+const peek = ptc("peek", dir => python(`
 import json, pathlib, sys
 root = pathlib.Path(json.loads(sys.argv[1])).expanduser().resolve()
 if not root.is_dir():
     raise ValueError("Create the inbox and add sample files first: " + str(root))
 files = sorted(p.name for p in root.iterdir() if not p.is_symlink() and p.is_file())
 print(json.dumps({"root": str(root), "files": files}))
-`, input.inbox),
+`, dir))
 
-    sort: ({ peek }) => peek.files.map(name => ({ name, basket: category(name) })),
-    nap: () => ({ message: "The mailbox is empty. Time for a sunny nap! 💤", delivered: [] }),
+const sort = ptc("sort", files => files.map(name => ({ name, basket: category(name) })))
 
-    // Read destinations here so they can change while this node is paused.
-    deliver: ({ peek, sort, input }) => python(`
+// destinations is an argument, so a change while paused makes this node run with the new value.
+const deliver = ptc("deliver", (root, items, destinations) => python(`
 import filecmp, json, pathlib, shutil, sys
 args = json.loads(sys.argv[1])
 root = pathlib.Path(args["root"])
@@ -75,31 +59,23 @@ for source, folder, target in parcels:
             shutil.copyfileobj(reader, writer)
 print(json.dumps({"message": "Special delivery, with little paw prints! 🐾",
                   "delivered": [str(target) for _, _, target in parcels]}))
-`, { root: peek.root, items: sort, destinations: input.destinations }),
+`, { root, items, destinations }))
 
-    receipt: ctx => ctx.any("nap", "deliver"),
-  },
-
-  guards: {
-    "sort→nap": ({ sort }) => sort.length === 0,
-    "sort→deliver": ELSE,
-  },
-
-  break: { deliver: true },
+const r = await flow("cat-post", async () => {
+  const box = await peek(inbox)
+  const parcels = await sort(box.files)
+  if (parcels.length === 0) return { message: "The mailbox is empty. Time for a sunny nap! 💤", delivered: [] }
+  await pause("check-parcels")
+  return deliver(box.root, parcels, destinations)
+}, {
   watch: {
-    parcels: c => c.sort.length,
-    baskets: c => c.sort.reduce((counts, item) => {
+    parcels: n => n.sort.length,
+    baskets: n => n.sort.reduce((counts, item) => {
       counts[item.basket] = (counts[item.basket] || 0) + 1
       return counts
     }, {}),
-    delivered: c => c.deliver.delivered.length,
+    delivered: n => n.deliver.delivered.length,
   },
 })
 
-if (r.status !== "done") {
-  return {
-    status: r.status, at: r.at, reason: r.reason, error: r.error,
-    parcels: r.ctx.sort, trace: r.trace,
-  }
-}
-return { ...r.value, trace: r.trace }
+return r.status === "done" ? { ...r.value, trace: r.trace } : r

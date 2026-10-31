@@ -1,27 +1,28 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
-import { injectFlow, STATE_TOOL_NAME } from "../inject.mjs";
+import { injectFlow, SAVE_TOOL_NAME } from "../inject.mjs";
 
 // Fake tools. `calls` counts how often each tool ran.
-const calls = {};
-// The checkpoint log of the test that runs now: flow name → events. Like the extension,
-// the fake state tool appends at once, so the log stays when the script fails later.
+let calls = {};
+// The saved records: flow name → records. Same rules as the save tool in index.ts.
 let db = {};
 const tools = [
 	{
-		name: "list",
-		execute: async ({ n }) => {
-			calls.list = (calls.list ?? 0) + 1;
-			return Array.from({ length: n }, (_, i) => ({ id: i + 1, owner: i % 3 === 0 ? "a" : null }));
+		name: "work",
+		execute: async ({ tag }) => {
+			calls[tag] = (calls[tag] ?? 0) + 1;
+			return calls[tag];
 		},
 	},
 	{
-		name: STATE_TOOL_NAME,
-		execute: async ({ op, name, events }) => {
-			db[name] ??= [];
-			if (op === "append") db[name].push(...events);
-			return { events: op === "load" ? db[name] : [] };
+		name: SAVE_TOOL_NAME,
+		execute: async ({ name, at, rec }) => {
+			const list = (db[name] ?? []).slice(0, at);
+			if (rec !== undefined) list.push(rec);
+			if (list.length) db[name] = list;
+			else delete db[name];
+			return "ok";
 		},
 	},
 ];
@@ -29,9 +30,12 @@ const sandbox = new CodemodeSandbox({ tools });
 const quick = new CodemodeSandbox({ tools, timeoutMs: 1500 });
 after(() => Promise.all([sandbox.close(), quick.close()]));
 
-async function exec(code, box = sandbox) {
-	return box.execute(injectFlow(code));
+function reset() {
+	db = {};
+	calls = {};
 }
+
+const exec = (code, box = sandbox) => box.execute(injectFlow(code, db));
 
 async function run(code) {
 	const r = await exec(code);
@@ -39,298 +43,243 @@ async function run(code) {
 	return r.value;
 }
 
-function fresh() {
-	db = {};
-	calls.list = 0;
-}
+const ats = (r) => r.trace.map((s) => s.at);
 
-const last = (name) => db[name]?.at(-1)?.t;
-
-function script({ n = 20, brk = "{}", bulk = "ids => ids.length", fresh = false, triage = "i => !i.owner", guardBulk = "c => c.triage.length > 10" } = {}) {
+// A test → (build | diagnose) → review pause → report flow. `passed` decides the branch.
+function delivery({ passed = true, build = "return { built: true }", watch = "{}", extra = "" } = {}) {
 	return `
-const graph = {
-  fetch:    ["triage"],
-  triage:   ["empty", "bulk", "oneByOne"],
-  empty:    [],
-  bulk:     ["report"],
-  oneByOne: ["report"],
-  report:   [],
-}
-const actions = {
-  fetch:    () => tools.list({ n: ${n} }),
-  triage:   ({ fetch }) => fetch.filter(${triage}),
-  empty:    () => "nothing",
-  bulk:     async ({ triage }) => { const f = ${bulk}; return f(triage.map(i => i.id)) },
-  oneByOne: ({ triage }) => triage.length,
-  report:   (ctx) => ({ touched: ctx.any("bulk", "oneByOne") }),
-}
-const guards = {
-  "triage→empty":    c => c.fetch.length === 0,
-  "triage→bulk":     ${guardBulk},
-  "triage→oneByOne": ELSE,
-}
-return await flow("issues", { graph, actions, guards, break: ${brk}, fresh: ${fresh},
-  watch: { left: c => c.triage.length, done: c => c.report.touched } })
+const test = ptc("test", async () => {
+  await tools.work({ tag: "test" })
+  return { passed: ${passed}, failed: ${passed ? 0 : 3} }
+})
+const build = ptc("build", async () => { await tools.work({ tag: "build" }); ${build} })
+const diagnose = ptc("diagnose", async () => { await tools.work({ tag: "diagnose" }); return "diff" })
+const report = ptc("report", (t, check) => ({ passed: t.passed, check }))
+${extra}
+return flow("delivery", async () => {
+  const t = await test()
+  const check = t.passed ? await build() : await diagnose()
+  await pause("review")
+  return report(t, check)
+}, { watch: ${watch} })
 `;
 }
 
-test("runs to the end, picks the right branch, resets the checkpoint", async () => {
-	fresh();
-	const big = await run(script({ n: 20 }));
-	assert.equal(big.status, "done");
-	assert.deepEqual(big.value, { touched: 13 });
-	assert.deepEqual(Object.keys(big.ctx), ["fetch", "triage", "bulk", "report"]);
-	assert.equal(last("issues"), "reset");
-
-	const small = await run(script({ n: 6 }));
-	assert.deepEqual(Object.keys(small.ctx), ["fetch", "triage", "oneByOne", "report"]);
-
-	const none = await run(script({ n: 0 }));
-	assert.equal(none.at, "empty");
-	assert.equal(none.value, "nothing");
-});
-
-test("break pauses once; resending continues and does not run fetch again", async () => {
-	fresh();
-	const p = await run(script({ brk: "{ bulk: true }" }));
+test("pauses, then a resend reuses done nodes and finishes", async () => {
+	reset();
+	const p = await run(delivery());
 	assert.equal(p.status, "paused");
-	assert.equal(p.at, "bulk");
-	assert.equal(p.reason, "break");
-	assert.equal(last("issues"), "hit");
+	assert.equal(p.at, "review#1");
+	assert.deepEqual(ats(p), ["test#1", "build#1"]);
 
-	const d = await run(script({ brk: "{ bulk: true }" }));
+	const d = await run(delivery());
 	assert.equal(d.status, "done");
-	assert.equal(calls.list, 1);
-	assert.equal(last("issues"), "reset");
+	assert.deepEqual(d.value, { passed: true, check: { built: true } });
+	assert.deepEqual(calls, { test: 1, build: 1 });
+	assert.deepEqual(d.trace.map((s) => [s.at, !!s.reused]), [["test#1", true], ["build#1", true], ["review#1", false], ["report#1", false]]);
+	assert.equal(db.delivery, undefined, "done clears the records");
 });
 
-test("conditional break stops only when true", async () => {
-	fresh();
-	const go = await run(script({ brk: "{ bulk: c => c.triage.length > 100 }" }));
-	assert.equal(go.status, "done");
-	const stop = await run(script({ brk: "{ bulk: c => c.triage.length > 5 }" }));
-	assert.equal(stop.status, "paused");
+test("native branches work", async () => {
+	reset();
+	await run(delivery({ passed: false }));
+	const d = await run(delivery({ passed: false }));
+	assert.deepEqual(d.value, { passed: false, check: "diff" });
+	assert.deepEqual(calls, { test: 1, diagnose: 1 });
 });
 
-test("a node that throws can be fixed and resumed; earlier nodes do not run again", async () => {
-	fresh();
-	const e = await run(script({ bulk: `ids => { throw new Error("boom") }` }));
+test("a failed node is retried with the same instance id", async () => {
+	reset();
+	const e = await run(delivery({ build: `throw new Error("boom")` }));
 	assert.equal(e.status, "error");
-	assert.equal(e.at, "bulk");
+	assert.equal(e.at, "build#1");
 	assert.equal(e.error, "boom");
 
-	const d = await run(script());
+	const p = await run(delivery());
+	assert.equal(p.status, "paused");
+	assert.deepEqual(calls, { test: 1, build: 2 });
+});
+
+test("a changed node runs again, and so do the nodes after it", async () => {
+	reset();
+	await run(delivery());
+	const p = await run(delivery({ build: "return { built: 2 }" }));
+	assert.equal(p.status, "paused");
+	assert.deepEqual(calls, { test: 1, build: 2 });
+	assert.deepEqual(p.trace.map((s) => !!s.reused), [true, false]);
+});
+
+test("changed arguments run the node again", async () => {
+	reset();
+	const flow = (n) => `
+const double = ptc("double", x => x * 2)
+return flow("args", async () => { const v = await double(${n}); await pause("p"); return v })`;
+	await run(flow(1));
+	assert.equal((await run(flow(1))).value, 2);
+	await run(flow(5));
+	const d = await run(flow(5));
+	assert.equal(d.value, 10);
+});
+
+test("a changed call order drops the records from there", async () => {
+	reset();
+	const flow = (order) => `
+const a = ptc("a", () => tools.work({ tag: "a" }))
+const b = ptc("b", () => tools.work({ tag: "b" }))
+return flow("order", async () => { ${order}; await pause("p"); return "ok" })`;
+	await run(flow("await a(); await b()"));
+	await run(flow("await b(); await a()"));
+	assert.deepEqual(calls, { a: 2, b: 2 });
+});
+
+test("a loop with pause gives each iteration its own instance", async () => {
+	reset();
+	const script = `
+const check = ptc("check", () => tools.work({ tag: "check" }))
+return flow("loop", async () => {
+  for (let i = 0; i < 5; i++) {
+    if (await check() >= 3) return "green"
+    await pause("fix")
+  }
+  return "gave up"
+})`;
+	assert.equal((await run(script)).at, "fix#1");
+	assert.equal((await run(script)).at, "fix#2");
+	const d = await run(script);
 	assert.equal(d.status, "done");
-	assert.equal(calls.list, 1);
+	assert.equal(d.value, "green");
+	assert.deepEqual(ats(d), ["check#1", "fix#1", "check#2", "fix#2", "check#3"]);
+	assert.equal(calls.check, 3);
+});
+
+test("catching the pause signal does not keep the flow running", async () => {
+	reset();
+	const r = await run(`
+const after = ptc("after", () => tools.work({ tag: "after" }))
+return flow("swallow", async () => {
+  try { await pause("p") } catch {}
+  try { await after() } catch {}
+  return "no"
+})`);
+	assert.equal(r.status, "paused");
+	assert.equal(r.at, "p#1");
+	assert.equal(calls.after, undefined);
+});
+
+test("a caught node error is a branch: it is saved and given again on resend", async () => {
+	reset();
+	const script = `
+const build = ptc("build", async () => { await tools.work({ tag: "build" }); throw new Error("red") })
+const diagnose = ptc("diagnose", () => tools.work({ tag: "diagnose" }))
+return flow("caught", async () => {
+  let why
+  try { await build() } catch (e) { why = e.message; await diagnose() }
+  await pause("p")
+  return why
+})`;
+	assert.equal((await run(script)).status, "paused");
+	const d = await run(script);
+	assert.equal(d.value, "red");
+	assert.deepEqual(calls, { build: 1, diagnose: 1 });
+});
+
+test("a saved error that is not caught any more is dropped, so the node is retried", async () => {
+	reset();
+	const node = `const build = ptc("build", async () => { await tools.work({ tag: "build" }); throw new Error("red") })
+const after = ptc("after", () => 1)`;
+	await run(`${node}
+return flow("drop", async () => { try { await build() } catch {} ; await after(); await pause("p") })`);
+	const e = await run(`${node}
+return flow("drop", async () => { await build() })`);
+	assert.equal(e.status, "error");
+	assert.equal(e.at, "build#1");
+	assert.equal(calls.build, 1, "the saved error is given again, not run");
+	await run(`${node}
+return flow("drop", async () => { await build() })`);
+	assert.equal(calls.build, 2);
+});
+
+test("tools cannot be called between nodes", async () => {
+	reset();
+	const r = await run(`return flow("outside", async () => tools.work({ tag: "x" }))`);
+	assert.equal(r.status, "error");
+	assert.match(r.error, /only inside a ptc\(\) node/);
+	assert.equal(calls.x, undefined);
+	const back = await run(`await flow("outside", async () => 1); return tools.work({ tag: "y" })`);
+	assert.equal(back, 1, "tools work again after flow() returns");
+});
+
+test("nodes run one at a time", async () => {
+	reset();
+	const r = await run(`
+const a = ptc("a", () => 1)
+const b = ptc("b", () => 2)
+return flow("par", async () => Promise.all([a(), b()]))`);
+	assert.equal(r.status, "error");
+	assert.match(r.error, /one at a time/);
+});
+
+test("arguments are copies: a node cannot change the caller's value", async () => {
+	reset();
+	const r = await run(`
+const grab = ptc("grab", () => ({ list: [1] }))
+const push = ptc("push", o => { o.list.push(2); return o.list.length })
+return flow("copy", async () => { const o = await grab(); const n = await push(o); return { n, o } })`);
+	assert.deepEqual(r.value, { n: 2, o: { list: [1] } });
+});
+
+test("watch records changes only, sees n.all, and is rebuilt on resend", async () => {
+	reset();
+	const watch = `{ failed: n => n.test.failed, runs: n => n.all.test.length, built: n => n.build.built }`;
+	const p = await run(delivery({ watch }));
+	assert.deepEqual(p.trace[0].watch, { failed: 0, runs: 1, built: "—" });
+	assert.deepEqual(p.trace[1].watch, { built: true });
+
+	const d = await run(delivery({ watch }));
+	assert.deepEqual(d.trace[0].watch, p.trace[0].watch);
+	assert.equal(d.trace[3].watch, undefined);
 });
 
 test("progress stays when the script fails or times out after a node is done", async () => {
-	fresh();
-	const thrown = await exec(script({ brk: "{ bulk: true }" }).replace("return await flow", "await flow") + "\nthrow new Error('late')");
-	assert.equal(thrown.ok, false);
-	const d = await run(script({ brk: "{ bulk: true }" }));
-	assert.equal(d.status, "done");
-	assert.equal(calls.list, 1);
+	reset();
+	const late = await exec(delivery().replace("return flow", "await flow") + "\nthrow new Error('late')");
+	assert.equal(late.ok, false);
+	assert.equal((await run(delivery())).status, "done");
+	assert.deepEqual(calls, { test: 1, build: 1 });
 
-	fresh();
-	const hang = await exec(script({ bulk: "ids => { for (;;) {} }" }), quick);
+	reset();
+	const hang = await exec(delivery({ build: "for (;;) {}" }), quick);
 	assert.equal(hang.ok, false);
 	assert.equal(hang.error.kind, "timeout");
-	const after = await run(script());
-	assert.equal(after.status, "done");
-	assert.equal(calls.list, 1);
+	await run(delivery());
+	assert.equal(calls.test, 1);
 });
 
-test("changing a done node is frozen; fresh starts over", async () => {
-	fresh();
-	await run(script({ brk: "{ bulk: true }" }));
-	const f = await run(script({ brk: "{ bulk: true }", triage: "i => i.owner === null" }));
-	assert.equal(f.status, "error");
-	assert.equal(f.reason, "frozen");
-	assert.equal(f.at, "triage");
-	assert.match(f.error, /its action changed/);
-	assert.equal(last("issues"), "hit", "a frozen error does not change the checkpoint");
-
-	const again = await run(script({ brk: "{ bulk: true }", triage: "i => i.owner === null", fresh: true }));
-	assert.equal(again.status, "paused");
-	assert.equal(calls.list, 2);
+test("fresh starts over", async () => {
+	reset();
+	await run(delivery());
+	const p = await run(delivery().replace("{ watch: {} }", "{ watch: {}, fresh: true }"));
+	assert.equal(p.status, "paused");
+	assert.equal(calls.test, 2);
 });
 
-test("changing a guard after its route is taken is frozen", async () => {
-	fresh();
-	await run(script({ brk: "{ bulk: true }" }));
-	const f = await run(script({ brk: "{ bulk: true }", guardBulk: "c => c.triage.length > 3" }));
-	assert.equal(f.reason, "frozen");
-	assert.equal(f.at, "triage");
-});
-
-test("only whitespace changed is not frozen", async () => {
-	fresh();
-	await run(script({ brk: "{ bulk: true }" }));
-	const d = await run(script({ brk: "{ bulk: true }", triage: "i  =>\n    !i.owner" }));
-	assert.equal(d.status, "done");
-});
-
-test("no route stops at the node; its guards can still change", async () => {
-	fresh();
-	const code = (g) => `
-return await flow("r", {
-  graph: { a: ["b", "c"], b: [], c: [] },
-  actions: { a: () => 5, b: () => "b", c: () => "c" },
-  guards: { "a→b": c => c.a > ${g}, "a→c": c => c.a < 0 },
-})`;
-	const n = await run(code(10));
-	assert.equal(n.status, "error");
-	assert.equal(n.reason, "no route");
-	assert.equal(n.at, "a");
-	const d = await run(code(1));
-	assert.equal(d.status, "done");
-	assert.equal(d.value, "b");
-});
-
-test("watch records changes only and does not block", async () => {
-	fresh();
-	const d = await run(script());
-	assert.equal(d.status, "done");
-	assert.deepEqual(d.trace, [
-		{ step: 1, node: "fetch", watch: { left: "—", done: "—" } },
-		{ step: 2, node: "triage", watch: { left: 13 } },
-		{ step: 4, node: "report", watch: { done: 13 } },
-	]);
-});
-
-test("watch trace continues across a resume", async () => {
-	fresh();
-	await run(script({ brk: "{ bulk: true }" }));
-	const d = await run(script({ brk: "{ bulk: true }" }));
-	assert.equal(d.trace.length, 3);
-	assert.deepEqual(d.trace[2], { step: 4, node: "report", watch: { done: 13 } });
-});
-
-test("reading a node that did not run throws; ctx.any works", async () => {
-	fresh();
-	const r = await run(`
-return await flow("ctx", {
-  graph: { a: ["b"], b: [] },
-  actions: { a: () => 1, b: (c) => { try { c.b } catch (e) { return [e.message, c.any("x", "a")] } } },
-})`);
-	assert.deepEqual(r.value, ["b did not run on this path", 1]);
-});
-
-test("functions cannot read or change variables of the script", async () => {
-	fresh();
-	const read = await run(`
-const LIMIT = 5
-return await flow("read", { graph: { a: [] }, actions: { a: () => LIMIT } })`);
-	assert.equal(read.status, "error");
-	assert.match(read.error, /LIMIT is not defined.*input.*helpers/);
-
-	const write = await run(`
-let seen = 0
-return await flow("write", { graph: { a: [] }, actions: { a: () => { seen = 1; return 1 } } })`);
-	assert.equal(write.status, "error");
-	assert.match(write.error, /seen is not defined/);
-});
-
-test("values in ctx are frozen", async () => {
-	fresh();
-	const r = await run(`
-return await flow("frz", {
-  graph: { a: ["b"], b: [] },
-  actions: { a: () => [3, 1, 2], b: ({ a }) => a.sort() },
-})`);
-	assert.equal(r.status, "error");
-	assert.match(r.error, /frozen.*Copy/);
-});
-
-test("helpers work by name, call each other, and work in method shorthand", async () => {
-	fresh();
-	const r = await run(`
-return await flow("h", {
-  helpers: { double: x => x * 2, quad: x => double(double(x)) },
-  graph: { a: ["b"], b: [] },
-  actions: { a() { return quad(1) }, async b({ a }) { return double(a) } },
-})`);
-	assert.equal(r.status, "done");
-	assert.equal(r.value, 8);
-});
-
-test("input: a key read by a done node is frozen, a key read only later is not", async () => {
-	fresh();
-	const code = (repo, limit) => `
-return await flow("in", {
-  input: { repo: "${repo}", limit: ${limit}, token: "SECRET_123" },
-  graph: { a: ["b"], b: [] },
-  actions: { a: ({ input }) => input.repo, b: ({ a, input }) => a + ":" + input.limit },
-  break: { b: true },
-})`;
-	await run(code("omo", 5));
-	const later = await run(code("omo", 9));
-	assert.equal(later.status, "done");
-	assert.equal(later.value, "omo:9");
-
-	await run(code("omo", 5));
-	const frozen = await run(code("pi", 5));
-	assert.equal(frozen.reason, "frozen");
-	assert.match(frozen.error, /input\.repo changed/);
-	assert.ok(!JSON.stringify(db).includes("SECRET_123"), "input values are not saved");
-});
-
-test("helpers: a helper used by a done node is frozen, one used only later is not", async () => {
-	fresh();
-	const code = (f, g) => `
-return await flow("hf", {
-  helpers: { f: x => ${f}, g: x => ${g} },
-  graph: { a: ["b"], b: [] },
-  actions: { a: () => f(1), b: ({ a }) => g(a) },
-  break: { b: true },
-})`;
-	await run(code("x + 1", "x * 10"));
-	const later = await run(code("x + 1", "x * 100"));
-	assert.equal(later.value, 200);
-
-	await run(code("x + 1", "x * 10"));
-	const frozen = await run(code("x + 2", "x * 10"));
-	assert.equal(frozen.reason, "frozen");
-	assert.match(frozen.error, /helpers\.f changed/);
-});
-
-test("guards must be synchronous", async () => {
-	fresh();
-	const r = await run(`
-return await flow("g", {
-  graph: { a: ["b", "c"], b: [], c: [] },
-  actions: { a: () => 1, b: () => 1, c: () => 1 },
-  guards: { "a→b": async () => true, "a→c": ELSE },
-})`);
-	assert.equal(r.status, "error");
-	assert.match(r.error, /synchronous/);
-});
-
-test("invalid flows fail before any node runs", async () => {
-	fresh();
-	const cases = [
-		[`{ a: ["b"], b: ["a"] }`, `{ a: () => 1, b: () => 1 }`, `{}`, /exactly one start/],
-		[`{ s: ["a"], a: ["b"], b: ["a"] }`, `{ s: () => 1, a: () => 1, b: () => 1 }`, `{}`, /cycle/],
-		[`{ a: ["b", "c"], b: [], c: [] }`, `{ a: () => 1, b: () => 1, c: () => 1 }`, `{ "a→x": ELSE }`, /no matching edge/],
-		[`{ a: ["b", "c"], b: [], c: [] }`, `{ a: () => 1, b: () => 1, c: () => 1 }`, `{ "a→b": () => true }`, /a→c needs a guard/],
-		[`{ a: ["b", "c"], b: [], c: [] }`, `{ a: () => 1, b: () => 1, c: () => 1 }`, `{ "a→b": ELSE, "a→c": () => true }`, /ELSE must be the last/],
-		[`{ a: [] }`, `{ a: () => 1, z: () => 1 }`, `{}`, /actions.z/],
-		[`{ input: [] }`, `{ input: () => 1 }`, `{}`, /cannot be a node name/],
-	];
-	for (const [graph, actions, guards, err] of cases) {
-		const r = await run(`return await flow("v", { graph: ${graph}, actions: ${actions}, guards: ${guards} })`);
-		assert.equal(r.status, "error");
-		assert.equal(r.reason, "invalid");
-		assert.match(r.error, err);
-	}
-	const badHelper = await run(`return await flow("v", { graph: { a: [] }, actions: { a: () => 1 }, helpers: { tools: () => 1 } })`);
-	assert.match(badHelper.error, /helpers.tools/);
-	assert.deepEqual(db.v ?? [], [], "an invalid flow saves nothing");
+test("invalid calls are reported", async () => {
+	reset();
+	assert.equal((await run(`return flow("", async () => 1)`)).reason, "invalid");
+	assert.equal((await run(`return flow("x", 1)`)).reason, "invalid");
+	assert.equal((await run(`return flow("x", async () => 1, { watch: { a: 1 } })`)).reason, "invalid");
+	const two = await run(`
+const a1 = ptc("a", () => 1)
+const a2 = ptc("a", () => 2)
+return flow("dup", async () => { await a1(); return a2() })`);
+	assert.match(two.error, /two different ptc\(\) nodes are named a/);
+	const outside = await exec(`const a = ptc("a", () => 1); await a(); return flow("x", async () => 1)`);
+	assert.equal(outside.ok, false);
+	assert.match(outside.error.message, /only inside flow\(\)/);
 });
 
 test("injectFlow leaves other scripts alone", () => {
 	assert.equal(injectFlow("return 1"), "return 1");
-	assert.equal(injectFlow("function flow() {}\nflow()"), "function flow() {}\nflow()");
-	assert.ok(injectFlow("flow('x', {})").includes("function ELSE"));
+	assert.equal(injectFlow("function flow() {} flow()"), "function flow() {} flow()");
+	assert.match(injectFlow("flow()", { a: [1] }), /function __m_saved\(\) \{ return \{"a":\[1\]\} \}/);
 });

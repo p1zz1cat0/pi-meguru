@@ -14,22 +14,15 @@ pi install npm:pi-meguru
 
 ## How it works
 
-One PTC call is split into three parts, written in plain JavaScript:
+A node is one independent PTC, defined with `ptc(name, fn)`. The orchestration is plain async JS inside `flow(name, fn, opts)`: `if` for branches, `for` for loops, and arguments to pass outputs between nodes.
 
-| Part | Definition |
-| ---- | ---- |
-| **`graph`** | Declares the nodes and how they connect. The graph must be a DAG with exactly one start node. Each run follows one path; branches do not run in parallel. |
-| **`actions`** | Defines what each node does. A node is one normal codemode step. Its return value is the node's output, which later nodes read through the read-only `ctx.<node>`. |
-| **`guards`** | Synchronous JS expressions that choose the next edge. Outgoing edges are checked in order, the first true condition wins, and `ELSE` is the last fallback. |
+When a script calls `flow()`, the extension appends the runtime and the saved records to the end of the script, and codemode runs them in its QuickJS sandbox. Tool calls keep Pi's usual permissions and hooks.
 
-When a script calls `flow()`, the extension appends the runtime to the end of the script, and codemode runs both in its QuickJS sandbox. Tool calls keep Pi's usual permissions and hooks.
+- **Resume**: each send runs the orchestration from the start. Node calls are matched with the records in call order. When the source and the arguments are the same, the saved output is returned. Otherwise the run continues from that call.
+- **`pause`**: stops and returns `paused`, so control goes back to the model. Send the same script again to continue after the pause.
+- **`watch`**: evaluated after each node. Only changes are recorded, and the run does not stop. The records come back with the result of `flow()`.
 
-`watch` and `break` decide when the model sees the run:
-
-- **Watchpoint**: after each node, the watch expressions are evaluated. Only changes are recorded, and the run does not stop. The records come back with the result of `flow()`, and the model reads them after this PTC call returns.
-- **Breakpoint**: before a node runs, its condition is checked. When it is true, progress is saved and `flow()` returns `paused`. After this codemode script ends, control goes back to the model, which decides how to continue. Break conditions must be synchronous, and the break on a node stops only once per run.
-
-When a node fails or no edge can be taken, progress is also saved and an error is returned. `flow()` only returns data and prints nothing by itself.
+The records are kept in the extension's memory only, not in the session. They are cleared when the flow is done, when the session changes, or when you move in the session tree. Tools cannot be called between nodes, because that code runs again on each send.
 
 ## Test
 

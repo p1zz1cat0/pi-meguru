@@ -1,7 +1,7 @@
 // Run real Pi turns with a local fake model. No model API request is sent.
-// Check: the runtime is injected, a break stops and the next call continues, the checkpoint
-// tool is reachable from the script but not shown to the model, and the runtime text does not
-// stay in the session file or in later model requests.
+// Check: the runtime is injected, a pause stops and the next call continues, the save tool is
+// reachable from the script but not shown to the model, and the records and the runtime text
+// do not go into the session file or into later model requests.
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,10 +15,12 @@ const { AuthStorage } = await import(url("dist/core/auth-storage.js"));
 const { createAssistantMessageEventStream } = await import(url("../pi-ai/dist/utils/event-stream.js"));
 
 const SCRIPT = `
-const r = await flow("smoke", {
-  graph: { a: ["b"], b: [] },
-  actions: { a: () => 41, b: ({ a }) => a + 1 },
-  break: { b: true },
+const a = ptc("a", () => ({ secret: "kept-in-memory" }))
+const b = ptc("b", x => x.secret.length + 28)
+const r = await flow("smoke", async () => {
+  const x = await a()
+  await pause("check")
+  return b(x)
 })
 return { status: r.status, at: r.at, value: r.value }
 `;
@@ -68,24 +70,25 @@ try {
 
 	await session.prompt("Run the flow.");
 	assert.equal(calls, 2);
-	assert.match(results()[0], /\\"status\\":\\"paused\\",\\"at\\":\\"b\\"/);
+	assert.match(results()[0], /\\"status\\":\\"paused\\",\\"at\\":\\"check#1\\"/);
 
 	await session.prompt("Continue.");
 	assert.equal(calls, 4);
-	assert.match(results()[1], /\\"status\\":\\"done\\",\\"at\\":\\"b\\",\\"value\\":42/);
+	assert.match(results()[1], /\\"status\\":\\"done\\",\\"at\\":\\"b#1\\",\\"value\\":42/);
 
 	const file = await readFile(manager.getSessionFile(), "utf8");
-	assert.match(file, /"customType":"meguru-state"/);
 	const declared = session.agent.state.tools;
 	assert.ok(declared.some((t) => t.name === "codemode"), "the model sees codemode");
-	assert.ok(!declared.some((t) => t.name === "meguru_state"), "the checkpoint tool is not declared to the model");
-	assert.ok(!declared.find((t) => t.name === "codemode").description.includes("meguru_state"), "codemode does not list the checkpoint tool");
+	assert.ok(!declared.some((t) => t.name === "meguru_save"), "the save tool is not declared to the model");
+	assert.ok(!declared.find((t) => t.name === "codemode").description.includes("meguru_save"), "codemode does not list the save tool");
+	const later = JSON.stringify(requests.at(-1));
 	const leaks = {
-		sessionFile: file.includes("__flow_run"),
-		laterRequest: JSON.stringify(requests.at(-1)).includes("__flow_run"),
+		runtimeInSessionFile: file.includes("__m_cur"),
+		runtimeInLaterRequest: later.includes("__m_cur"),
+		recordsInSessionFile: file.includes('"k":"node"') || file.includes('"customType"'),
 	};
-	console.log("runtime text found in:", leaks);
-	assert.deepEqual(leaks, { sessionFile: false, laterRequest: false });
+	console.log("found:", leaks);
+	assert.deepEqual(leaks, { runtimeInSessionFile: false, runtimeInLaterRequest: false, recordsInSessionFile: false });
 	console.log("pi-meguru smoke ok");
 } finally {
 	await session?.dispose?.();

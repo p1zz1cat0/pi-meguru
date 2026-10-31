@@ -1,53 +1,63 @@
 ---
 name: flow
-description: Use codemode flows for branching tool work with breakpoints and checkpoints.
+description: Use codemode flows for multi-step tool work that must pause, resume, or be watched.
 ---
 
 # flow
 
-Call `flow(name, opts)` inside codemode. Split work into `graph`, `actions`, and `guards`.
+Inside codemode, define nodes with `ptc(name, fn)` and orchestrate them with plain async JS in `flow(name, fn, opts)`.
 
 ```js
-const r = await flow("check", {
-  input: { command: "git status --short", title: "Changed files" },
-  helpers: { lines: s => s.split("\n").filter(Boolean) },
-  graph: { inspect: ["empty", "report"], empty: [], report: [] },
-  actions: {
-    inspect: async ({ input }) => {
-      const r = await tools.bash({ command: input.command })
-      if (r.exit_code !== 0) throw new Error(r.output)
-      return lines(r.output)
-    },
-    empty: () => "No changes",
-    report: ({ inspect, input }) => ({ title: input.title, files: inspect }),
-  },
-  guards: {
-    "inspect→empty": c => c.inspect.length === 0,
-    "inspect→report": ELSE,
-  },
-  break: { report: true },
-  watch: { count: c => c.inspect.length },
+const test = ptc("test", async () => {
+  const r = await tools.bash({ command: "npm test" })
+  return { passed: r.exit_code === 0, log: r.output.slice(-2000) }
 })
-return r.status === "done"
-  ? { value: r.value, trace: r.trace }
-  : { status: r.status, at: r.at, reason: r.reason, error: r.error,
-      preview: r.ctx.inspect, trace: r.trace }
+const build = ptc("build", async () => {
+  const r = await tools.bash({ command: "npm run build" })
+  if (r.exit_code !== 0) throw new Error(r.output.slice(-2000))
+  return { ok: true }
+})
+const diagnose = ptc("diagnose", async () => (await tools.bash({ command: "git diff --stat" })).output)
+const report = ptc("report", (t, check) => ({ passed: t.passed, check }))
+
+const r = await flow("delivery", async () => {
+  const t = await test()
+  const check = t.passed ? await build() : await diagnose()
+  await pause("review")
+  return report(t, check)
+}, { watch: { passed: n => n.test.passed } })
+
+return r.status === "done" ? { value: r.value, trace: r.trace } : r
 ```
 
-## Execution
+## Nodes
 
-- `graph`: a DAG with one start node. Each run follows one path. `[]` ends it. Put loops inside actions. Node names cannot be `input` or `any`.
-- `actions`: async functions returning JSON. Read completed outputs as `ctx.<node>`; nodes that have not run throw. At joins, use `ctx.any("a", "b")` for the first output available.
-- `guards`: synchronous conditions, checked in graph order; first true wins. Every edge of a branch needs a guard. Put `ELSE` last. No match returns `reason: "no route"`. Do not call tools in guards.
-- `break`: `true` or a synchronous condition, checked before the node. A hit returns `paused`; the same breakpoint stops only once per run.
-- `watch`: synchronous expressions, evaluated after each node. Changes go into `trace` without pausing. Unavailable or failed values become `"—"`. Do not call tools in watches.
+- A node is one normal codemode step. It can use closures, script functions, and `tools`.
+- Each call is an instance: `test#1`, `test#2`. Arguments and return values must be JSON. Arguments are copied in, so a node cannot change the caller's values.
+- Pass upstream outputs as arguments. Do not read or change outer variables from a node: a reused node does not run again, so its side effects on variables do not happen.
+- Call tools only inside nodes. `tools` throws between nodes.
+- Await each node before calling the next. Nodes do not run in parallel, and a node cannot call a node or `pause()`.
 
-## State and continuation
+## Orchestration
 
-Functions are rebuilt from source and cannot capture script variables. Put JSON data in `input`, read it through `ctx.input`, and put shared functions in `helpers`. Call helpers by name; they can call other helpers and `tools`. Values in `ctx` are deeply frozen; copy before modifying.
+- Use plain `if`, ternaries, `for`, `try/catch`. Put an upper limit on every loop.
+- `await pause(name)` stops the flow and returns `paused`. For a conditional pause, write `if (cond) await pause(name)`. Do not catch the pause.
+- The orchestration code runs again on every resend. Keep it deterministic: no `Date.now()` or `Math.random()` for branch decisions.
+- A node error that the orchestration catches is a branch result. It is saved and thrown again on resend without running the node.
+- An uncaught node error returns `error` at that instance. Fix it and resend to retry the same instance.
 
-Send the script again with the same flow name to continue. Completed nodes reuse saved outputs. You can edit pending actions, and inputs or helpers unused by completed actions and routed guards. Changing completed dependencies returns `reason: "frozen"`; use `fresh: true` to restart. Fix a failed action and resend to retry it. Progress is saved at node boundaries, including before a later script failure or timeout.
+## Continuation
 
-Do not call tools outside `flow()`: outer code runs again on continuation. Return only the results needed by the model; `flow()` does not print. Results contain `status`, `at`, `reason`, `ctx`, `trace`, and optional `value` or `error`.
+Send the same script again with the same flow name to continue. Each call is matched in order:
 
-Keep node outputs small; they remain in the session history. Input values are not included in checkpoint payloads, but literals in the script are still part of the conversation.
+- Same node, same source, same arguments: the saved output is reused.
+- Changed source or arguments, or a different call order: that call and every call after it run again.
+- `fresh: true` drops all saved records.
+
+The records are kept in memory only. They are cleared when the flow is done, when the session changes, and when you move in the session tree. They are not in the session history.
+
+## Watch and result
+
+- `watch: { key: n => ... }` runs after each node. `n.<node>` is the latest output, `n.all.<node>` is every output. Only changes are recorded. Failed or unavailable values become `"—"`. Do not call tools in watches. A node cannot be named `all`.
+- `flow()` returns `{ status, at, reason, trace, value?, error? }` and prints nothing. `status` is `done`, `paused`, or `error`. `at` is an instance id. Each `trace` step has `at`, and optionally `reused`, `watch`, or `error`.
+- Return only what the model needs. Keep node outputs small.

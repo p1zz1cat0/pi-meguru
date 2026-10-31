@@ -1,7 +1,7 @@
 {
   "name": "pi-meguru",
-  "version": "0.1.0",
-  "description": "Topology / actions / guards for pi codemode scripts, with checkpoints, breakpoints and watchpoints.",
+  "version": "0.2.0",
+  "description": "Lightweight DAG orchestration for Pi codemode: independent PTC nodes, plain JS orchestration, pause, resume and watch.",
   "license": "MPL-2.0",
   "type": "module",
   "scripts": {
