@@ -1,80 +1,75 @@
-// Paste this script into codemode. The host must have Python 3.
-// Put sample files in .work/cat-post/inbox before the first call.
-// At the pause, check parcels and change destinations if required.
-// Send the script again to continue. Delivery copies files and keeps the originals.
-const inbox = ".work/cat-post/inbox"
-const destinations = {
-  pictures: ".work/cat-post/album",
-  documents: ".work/cat-post/bookshelf",
-  other: ".work/cat-post/treasure-box",
-}
+const root = "."
+const districts = [
+  { name: "Workshop 🛠️", patterns: ["**/*.{js,mjs,cjs,ts,tsx,jsx}", "!**/test/**", "!**/tests/**", "!**/*.test.*", "!**/*.spec.*"] },
+  { name: "Training grounds 🧶", patterns: ["**/test/**", "**/tests/**", "**/*.test.*", "**/*.spec.*"] },
+  { name: "Library 📚", patterns: ["**/*.{md,mdx}"] },
+]
 
-const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'"
-async function python(source, data) {
-  const result = await tools.bash({
-    command: "python3 -c " + quote(source) + " " + quote(JSON.stringify(data)),
+const scout = ptc("scout", async (path, district) => {
+  const r = await tools.glob({ path, pattern: district.patterns, limit: 8 })
+  if (r.failed?.length) throw new Error(JSON.stringify(r.failed))
+  return {
+    name: district.name,
+    patterns: district.patterns,
+    files: r.total ?? null,
+    sample: r.items,
+    complete: r.scanComplete && r.pageComplete && !r.hasMore,
+  }
+})
+
+const patrol = ptc("patrol", async (path, district) => {
+  const r = await tools.grep({
+    path,
+    glob: district.patterns,
+    pattern: "\\b(TODO|FIXME|HACK)\\b",
+    limit: 6,
   })
-  if (result.exit_code !== 0) throw new Error(result.output)
-  return JSON.parse(result.output)
-}
-function category(name) {
-  const ext = name.toLowerCase().split(".").pop()
-  if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) return "pictures"
-  if (["pdf", "md", "txt", "docx"].includes(ext)) return "documents"
-  return "other"
-}
+  if (r.failed?.length) throw new Error(JSON.stringify(r.failed))
+  return {
+    name: district.name,
+    markers: r.total ?? null,
+    clues: r.items,
+    complete: r.scanComplete && r.pageComplete && !r.hasMore,
+    skipped: r.skippedFiles ?? null,
+  }
+})
 
-const peek = ptc("peek", dir => python(`
-import json, pathlib, sys
-root = pathlib.Path(json.loads(sys.argv[1])).expanduser().resolve()
-if not root.is_dir():
-    raise ValueError("Create the inbox and add sample files first: " + str(root))
-files = sorted(p.name for p in root.iterdir() if not p.is_symlink() and p.is_file())
-print(json.dumps({"root": str(root), "files": files}))
-`, dir))
+const briefing = ptc("briefing", (map, patrols) => ({
+  message: "Scouts are back! Check the paw prints before we pack the report. 🐾",
+  districts: map.map(area => ({
+    name: area.name,
+    files: area.files,
+    sample: area.sample,
+    inventoryComplete: area.complete,
+  })),
+  patrols,
+}))
 
-const sort = ptc("sort", files => files.map(name => ({ name, basket: category(name) })))
+const report = ptc("report", (camp, title) => ({
+  ...camp,
+  title,
+  message: "Expedition complete. Snacks for every scout! 🐟",
+  note: "Markers are review leads, not confirmed bugs. Samples are bounded; incomplete or skipped scans are not a clean bill of health. Tool traversal exclusions still apply.",
+}))
 
-// destinations is an argument, so a change while paused makes this node run with the new value.
-const deliver = ptc("deliver", (root, items, destinations) => python(`
-import filecmp, json, pathlib, shutil, sys
-args = json.loads(sys.argv[1])
-root = pathlib.Path(args["root"])
-parcels = []
-for item in args["items"]:
-    source = root / item["name"]
-    folder = pathlib.Path(args["destinations"][item["basket"]]).expanduser().resolve()
-    target = folder / item["name"]
-    if source.is_symlink() or not source.is_file():
-        raise ValueError("Parcel is no longer a regular file: " + str(source))
-    if source == target or target.is_symlink():
-        raise ValueError("Choose another destination: " + str(target))
-    if target.exists() and not filecmp.cmp(source, target, shallow=False):
-        raise ValueError("A different parcel already exists: " + str(target))
-    parcels.append((source, folder, target))
-for source, folder, target in parcels:
-    folder.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        with source.open("rb") as reader, target.open("xb") as writer:
-            shutil.copyfileobj(reader, writer)
-print(json.dumps({"message": "Special delivery, with little paw prints! 🐾",
-                  "delivered": [str(target) for _, _, target in parcels]}))
-`, { root, items, destinations }))
-
-const r = await flow("cat-post", async () => {
-  const box = await peek(inbox)
-  const parcels = await sort(box.files)
-  if (parcels.length === 0) return { message: "The mailbox is empty. Time for a sunny nap! 💤", delivered: [] }
-  await pause("check-parcels")
-  return deliver(box.root, parcels, destinations)
+const r = await flow("cat-expedition", async () => {
+  const map = []
+  const patrols = []
+  for (const district of districts.slice(0, 3)) {
+    const area = await scout(root, district)
+    map.push(area)
+    if (area.files !== 0 || !area.complete) {
+      patrols.push(await patrol(root, district))
+    }
+  }
+  const camp = await briefing(map, patrols)
+  await pause("campfire-review")
+  return report(camp, "Cat Expedition · Repository Field Notes 🐾")
 }, {
   watch: {
-    parcels: n => n.sort.length,
-    baskets: n => n.sort.reduce((counts, item) => {
-      counts[item.basket] = (counts[item.basket] || 0) + 1
-      return counts
-    }, {}),
-    delivered: n => n.deliver.delivered.length,
+    scouts: n => n.all.scout.length,
+    latestDistrict: n => n.scout.name,
+    camp: n => n.briefing,
   },
 })
 

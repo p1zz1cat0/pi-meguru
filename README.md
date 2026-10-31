@@ -33,4 +33,6 @@ node test/pi-smoke.mjs
 
 ## Example
 
-[Cat post office](example.js)
+[Cat expedition](example.js): a read-only repository patrol using Pi's `glob` and `grep` tools. Scouts visit source, test, and documentation districts, collect bounded samples of TODO/FIXME/HACK markers, and pause at the campfire for review. Send the same script again to reuse their findings and finish the report. No shell, Python, or sample files are required.
+
+Set `root` to the repository path before starting. Samples and traversal exclusions limit coverage; markers are review leads, not confirmed bugs. The example demonstrates repeated node instances, conditional patrols, argument passing, watches, and pause/resume.
