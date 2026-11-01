@@ -18,10 +18,14 @@ const tools = [
 	{
 		name: SAVE_TOOL_NAME,
 		execute: async ({ name, at, rec }) => {
-			const list = (db[name] ?? []).slice(0, at);
-			if (rec !== undefined) list.push(rec);
-			if (list.length) db[name] = list;
-			else delete db[name];
+			if (at === undefined) delete db[name];
+			else {
+				const records = db[name] ?? Object.create(null);
+				if (rec === undefined) delete records[at];
+				else records[at] = rec;
+				if (Object.keys(records).length) db[name] = records;
+				else delete db[name];
+			}
 			return "ok";
 		},
 	},
@@ -100,13 +104,13 @@ test("a failed node is retried with the same instance id", async () => {
 	assert.deepEqual(calls, { test: 1, build: 2 });
 });
 
-test("a changed node runs again, and so do the nodes after it", async () => {
+test("a changed node runs again without resetting an existing pause", async () => {
 	reset();
 	await run(delivery());
 	const p = await run(delivery({ build: "return { built: 2 }" }));
-	assert.equal(p.status, "paused");
+	assert.equal(p.status, "done");
 	assert.deepEqual(calls, { test: 1, build: 2 });
-	assert.deepEqual(p.trace.map((s) => !!s.reused), [true, false]);
+	assert.deepEqual(p.trace.map((s) => !!s.reused), [true, false, false, false]);
 });
 
 test("changed arguments run the node again", async () => {
@@ -121,7 +125,7 @@ return flow("args", async () => { const v = await double(${n}); await pause("p")
 	assert.equal(d.value, 10);
 });
 
-test("a changed call order drops the records from there", async () => {
+test("a changed call order preserves independently matched records", async () => {
 	reset();
 	const flow = (order) => `
 const a = ptc("a", () => tools.work({ tag: "a" }))
@@ -129,7 +133,7 @@ const b = ptc("b", () => tools.work({ tag: "b" }))
 return flow("order", async () => { ${order}; await pause("p"); return "ok" })`;
 	await run(flow("await a(); await b()"));
 	await run(flow("await b(); await a()"));
-	assert.deepEqual(calls, { a: 2, b: 2 });
+	assert.deepEqual(calls, { a: 1, b: 1 });
 });
 
 test("a loop with pause gives each iteration its own instance", async () => {
@@ -282,4 +286,112 @@ test("injectFlow leaves other scripts alone", () => {
 	assert.equal(injectFlow("return 1"), "return 1");
 	assert.equal(injectFlow("function flow() {} flow()"), "function flow() {} flow()");
 	assert.match(injectFlow("flow()", { a: [1] }), /function __m_saved\(\) \{ return \{"a":\[1\]\} \}/);
+});
+
+test("inserting a node preserves siblings and changed outputs invalidate consumers", async () => {
+	reset();
+	const script = (insert, value) => `
+const a = ptc("a", async () => { await tools.work({ tag: "a" }); return ${value} })
+const b = ptc("b", x => tools.work({ tag: "b" + x }))
+const extra = ptc("extra", () => tools.work({ tag: "extra" }))
+return flow("insert", async () => {
+  const x = await a(); ${insert ? 'await extra();' : ''}
+  await b(x); await pause("review"); await pause("finish")
+})`;
+	await run(script(false, 1));
+	const p = await run(script(true, 1));
+	assert.equal(p.at, "finish#1");
+	assert.deepEqual(calls, { a: 1, b1: 1, extra: 1 });
+	const d = await run(script(true, 2));
+	assert.equal(d.status, "done");
+	assert.deepEqual(calls, { a: 2, b1: 1, extra: 1, b2: 1 });
+});
+
+test("map is one trace node and keyed items survive reorder, insertion and partial failure", async () => {
+	reset();
+	const script = (items, fail) => `
+const verify = ptc("verify", async task => {
+  const count = await tools.work({ tag: task.id });
+  if (task.fail) throw new Error("broken");
+  return { id: task.id, value: task.value, count };
+})
+return flow("batch", async () => {
+  const result = await verify.map(${JSON.stringify(items.map(id => ({ id, value: id === 'b' ? 2 : 1, fail: fail && id === 'b' })))}, { key: task => task.id });
+  await pause("review"); return result;
+}, { watch: { batch: n => n["verify.map"] } })`;
+	const e = await run(script(['a', 'b'], true));
+	assert.equal(e.status, "error");
+	assert.match(e.at, /verify.map#1\/\[%22b%22\]\/verify#1/);
+	assert.equal(e.trace.length, 1);
+	const p = await run(script(['b', 'c', 'a'], false));
+	assert.equal(p.status, "paused");
+	assert.equal(p.trace.length, 1);
+	assert.equal(p.trace[0].children.length, 3);
+	assert.equal(p.trace[0].children[2].children[0].reused, true);
+	const d = await run(script(['b', 'c', 'a'], false));
+	assert.deepEqual(d.value.map(x => x.id), ['b', 'c', 'a']);
+	assert.deepEqual(calls, { a: 1, b: 2, c: 1 });
+});
+
+test("nested groups pause and resume with separate identities and watches", async () => {
+	reset();
+	const script = `
+const leaf = ptc("leaf", task => tools.work({ tag: task.id }));
+const inner = group("inner", async task => {
+  const value = await leaf(task);
+  await pause("review");
+  return value;
+});
+const outer = group("outer", task => inner(task));
+return flow("nested", () => outer.map([{id:"a"}, {id:"b"}], {key: x => x.id}), {
+  watch: { count: n => n.all.leaf.length, result: n => n["outer.map"] }
+});`;
+	const a = await run(script);
+	assert.equal(a.status, "paused");
+	assert.match(a.at, /\[%22a%22\]\/outer#1\/inner#1\/review#1$/);
+	const b = await run(script);
+	assert.equal(b.status, "paused");
+	assert.match(b.at, /\[%22b%22\]\/outer#1\/inner#1\/review#1$/);
+	const d = await run(script);
+	assert.equal(d.status, "done");
+	assert.deepEqual(d.value, [1, 1]);
+	assert.deepEqual(calls, { a: 1, b: 1 });
+	assert.equal(d.trace.length, 1);
+	assert.deepEqual(d.trace[0].watch.result, [1, 1]);
+	assert.equal(d.trace[0].children[0].children[0].children[0].children[0].watch.count, 1);
+});
+
+test("native retry combinators replay failures and propagate control signals", async () => {
+	reset();
+	const script = `
+const retry = (node, n) => async (...args) => {
+  for (let i = 0; i < n; i++) {
+    try { return await node(...args) }
+    catch (e) { if (isFlowStop(e) || i === n - 1) throw e }
+  }
+};
+const attempt = ptc("attempt", async () => {
+  const count = await tools.work({ tag: "attempt" });
+  if (count < 2) throw new Error("retry");
+  return count;
+});
+const task = group("task", async () => {
+  const value = await retry(attempt, 3)();
+  await pause("review"); return value;
+});
+return flow("retry", () => retry(task, 3)());`;
+	assert.equal((await run(script)).status, "paused");
+	const d = await run(script);
+	assert.equal(d.value, 2);
+	assert.deepEqual(calls, { attempt: 2 });
+});
+
+test("map rejects invalid and duplicate keys before executing items", async () => {
+	reset();
+	const prefix = `const a = ptc("a", x => tools.work({tag: String(x)}));`;
+	const dup = await run(`${prefix} return flow("dup-map", () => a.map([1, 1], {key: x => x}))`);
+	assert.match(dup.error, /duplicate map key/);
+	const invalid = await run(`${prefix} return flow("bad-map", () => a.map([1], {key: x => ({x})}))`);
+	assert.match(invalid.error, /key must be a string or finite number/);
+	assert.deepEqual(calls, {});
 });

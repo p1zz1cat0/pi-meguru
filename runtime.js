@@ -13,23 +13,24 @@ function ptc(name, fn) {
   if (typeof name !== "string" || !name || name === "all") throw new Error("ptc(name, fn): name must be a non-empty string other than \"all\"")
   if (typeof fn !== "function") throw new Error("ptc(" + name + ", fn): fn must be a function")
   var src = __m_hash(__m_src(fn))
-  return function () { return __m_node(name, fn, src, Array.prototype.slice.call(arguments)) }
+  var node = function () { return __m_node(name, fn, src, Array.prototype.slice.call(arguments)) }
+  node.map = function (items, opts) { return __m_map(name, node, items, opts) }
+  return node
 }
 
 // Stop the flow and give control back to the model. A resend continues after this pause.
 async function pause(name) {
   var r = __m_enter(typeof name === "string" && name ? name : "pause")
   await __m_flush(r)
-  var i = r.i++, rec = r.saved[i]
-  if (rec && rec.k === "pause" && rec.n === r.busy.n) {
-    r.trace.push({ at: r.busy.at })
-    r.last = r.busy.at
+  var at = r.busy.at, rec = r.saved[at]
+  if (rec && rec.k === "pause") {
+    r.trace.push({ at: at })
+    r.last = at
     r.busy = null
     return
   }
-  r.saved.length = i
-  r.saved[i] = { k: "pause", n: r.busy.n }
-  await __m_save(r, i, r.saved[i])
+  r.saved[at] = { k: "pause" }
+  await __m_save(r, at, r.saved[at])
   __m_stop(r, { status: "paused", at: r.busy.at, reason: "pause" })
 }
 
@@ -43,9 +44,10 @@ async function flow(name, fn, opts) {
 
   var all = __m_saved()
   var r = {
-    name: name, saved: o.fresh ? [] : (all[name] || []).slice(), i: 0, tools: tools,
-    busy: null, counts: {}, srcs: {}, last: null, failed: null, pending: null, stop: null,
-    watch: o.watch || {}, seen: {}, latest: {}, all: {}, trace: [],
+    name: name, saved: Object.assign(Object.create(null), o.fresh ? {} : all[name]), tools: tools,
+    prefix: "",
+    busy: null, counts: Object.create(null), srcs: Object.create(null), last: null, failed: null, pending: null, stop: null,
+    watch: o.watch || {}, seen: Object.create(null), latest: Object.create(null), all: Object.create(null), trace: [],
   }
   var raw = tools, value, err, threw = false
   __m_cur = r
@@ -58,7 +60,7 @@ async function flow(name, fn, opts) {
     },
   })
   try {
-    if (o.fresh && (all[name] || []).length) await __m_save(r, 0)
+    if (o.fresh && all[name]) await __m_save(r)
     value = await fn()
     value = __m_json(value === undefined ? null : value)
   } catch (e) {
@@ -74,9 +76,9 @@ async function flow(name, fn, opts) {
   else if (threw && r.failed && err === r.failed.e) {
     out = { status: "error", at: r.failed.at, reason: "error", error: __m_msg(err) }
     // A saved error that the flow does not catch now: drop it, so a resend runs the node again.
-    if (r.failed.i !== undefined) {
+    if (r.failed.saved) {
       try {
-        await raw.meguru_save({ name: name, at: r.failed.i })
+        await raw.meguru_save({ name: name, at: r.failed.at })
       } catch (e) {
         out.error += ". Also cannot save the checkpoint: " + __m_msg(e)
       }
@@ -86,7 +88,7 @@ async function flow(name, fn, opts) {
   else {
     out = { status: "done", at: r.last, reason: null, value: value }
     try {
-      await raw.meguru_save({ name: name, at: 0 })
+      await raw.meguru_save({ name: name })
     } catch (e) {
       out = { status: "error", at: r.last, reason: "error", error: "cannot clear the checkpoint: " + __m_msg(e) }
     }
@@ -107,38 +109,42 @@ async function __m_node(name, fn, src, args) {
     __m_throw(r, name + "(): arguments must be JSON: " + __m_msg(e))
   }
   await __m_flush(r)
-  var at = r.busy.at, h = __m_hash(src + "|" + argText), i = r.i++, rec = r.saved[i], reused = true
+  var at = r.busy.at, h = __m_hash(src + "|" + argText), rec = r.saved[at], reused = true
 
   if (!rec || rec.k !== "node" || rec.n !== name || rec.h !== h) {
-    // A new call, or the script changed here. Records from here on are not valid any more.
+    // Replace only this instance when its source or arguments change.
     reused = false
-    r.saved.length = i
-    var out, failed = null
+    if (rec) {
+      delete r.saved[at]
+      await __m_save(r, at)
+    }
+    var out, failed = false, failure
     try {
       out = await fn.apply(null, JSON.parse(argText))
       out = __m_json(out === undefined ? null : out)
     } catch (e) {
-      failed = e
+      failed = true
+      failure = e
     }
     if (failed) {
       // Save the error only when the flow catches it and goes on: see __m_flush.
-      r.failed = { e: failed, at: at }
-      r.pending = { i: i, rec: { k: "node", n: name, h: h, err: __m_msg(failed) } }
-      r.trace.push({ at: at, error: __m_msg(failed) })
+      r.failed = { e: failure, at: at }
+      r.pending = { at: at, rec: { k: "node", n: name, h: h, err: __m_msg(failure) } }
+      r.trace.push({ at: at, error: __m_msg(failure) })
       r.last = at
       r.busy = null
-      throw failed
+      throw failure
     }
     rec = { k: "node", n: name, h: h, out: out }
-    r.saved[i] = rec
-    await __m_save(r, i, rec)
+    r.saved[at] = rec
+    await __m_save(r, at, rec)
   }
 
   r.last = at
   r.busy = null
   if (rec.err !== undefined) {
     var again = new Error(rec.err)
-    r.failed = { e: again, at: at, i: i }
+    r.failed = { e: again, at: at, saved: true }
     r.trace.push({ at: at, reused: true, error: rec.err })
     throw again
   }
@@ -152,6 +158,87 @@ async function __m_node(name, fn, src, args) {
   return __m_json(rec.out)
 }
 
+// Return true for a pause or checkpoint stop. Combinators must rethrow it.
+function isFlowStop(error) {
+  return !!(__m_cur && __m_cur.stop && error === __m_cur.stop.signal)
+}
+
+// Define a scoped subflow. Replay its orchestration and reuse its child records.
+function group(name, fn) {
+  if (typeof name !== "string" || !name || name === "all" || typeof fn !== "function") throw new Error("group(name, fn): provide a name and function")
+  var node = function () {
+    var args = Array.prototype.slice.call(arguments)
+    return __m_group(name, function () { return fn.apply(null, __m_json(args)) })
+  }
+  node.map = function (items, opts) { return __m_map(name, node, items, opts) }
+  return node
+}
+
+async function __m_group(name, fn, segment) {
+  var r = __m_enter(name)
+  await __m_flush(r)
+  var at = segment === undefined ? r.busy.at : r.prefix + segment
+  var parent = { prefix: r.prefix, counts: r.counts, srcs: r.srcs, trace: r.trace, latest: r.latest, all: r.all, seen: r.seen }
+  var step = { at: at, children: [] }
+  r.prefix = (segment === undefined ? at : parent.prefix + segment) + "/"
+  r.counts = Object.create(null)
+  r.srcs = Object.create(null)
+  r.trace = step.children
+  r.latest = Object.create(null)
+  r.all = Object.create(null)
+  r.seen = Object.create(null)
+  r.busy = null
+  var value, failed = false, error
+  try {
+    value = await fn()
+    value = __m_json(value === undefined ? null : value)
+    if (r.stop) throw r.stop.signal
+  } catch (e) {
+    failed = true
+    error = e
+    if (!isFlowStop(e)) step.error = __m_msg(e)
+  } finally {
+    r.prefix = parent.prefix
+    r.counts = parent.counts
+    r.srcs = parent.srcs
+    r.trace = parent.trace
+    r.latest = parent.latest
+    r.all = parent.all
+    r.seen = parent.seen
+    r.busy = null
+    r.trace.push(step)
+  }
+  if (failed) throw error
+  r.last = at
+  r.latest[name] = value
+  ;(r.all[name] = r.all[name] || []).push(value)
+  var watch = __m_watch(r)
+  if (watch) step.watch = watch
+  return __m_json(value)
+}
+
+// Run a batch in order. Keys identify items independently of their positions.
+async function __m_map(name, node, items, opts) {
+  var o = opts || {}
+  if (!Array.isArray(items) || typeof o.key !== "function") throw new Error("map(items, { key }): provide an array and a key function")
+  var input = __m_json(items), keys = [], seen = Object.create(null)
+  for (var i = 0; i < input.length; i++) {
+    var key = o.key(input[i])
+    if (typeof key !== "string" && !(typeof key === "number" && isFinite(key))) throw new Error("map key must be a string or finite number")
+    var id = encodeURIComponent(JSON.stringify(key))
+    if (seen[id]) throw new Error("duplicate map key: " + key)
+    seen[id] = true
+    keys.push(id)
+  }
+  return __m_group(name + ".map", async function () {
+    var values = []
+    for (var i = 0; i < input.length; i++) {
+      values.push(await __m_group("item", function () { return node(input[i]) }, "[" + keys[i] + "]"))
+    }
+    return values
+  })
+}
+
 // Start a node or pause call. Return the flow with r.busy = { n, at }.
 function __m_enter(n) {
   var r = __m_cur
@@ -159,7 +246,7 @@ function __m_enter(n) {
   if (r.stop) throw r.stop.signal
   if (r.busy) __m_throw(r, "nodes run one at a time, and a node cannot call a node or pause(). Await " + r.busy.at + " before you call " + n + ".")
   r.counts[n] = (r.counts[n] || 0) + 1
-  r.busy = { n: n, at: n + "#" + r.counts[n] }
+  r.busy = { n: n, at: r.prefix + encodeURIComponent(n) + "#" + r.counts[n] }
   return r
 }
 
@@ -168,11 +255,11 @@ async function __m_flush(r) {
   var p = r.pending
   if (!p) return
   r.pending = null
-  r.saved[p.i] = p.rec
-  await __m_save(r, p.i, p.rec)
+  r.saved[p.at] = p.rec
+  await __m_save(r, p.at, p.rec)
 }
 
-// Cut the saved records to `at`, then add rec when given.
+// Replace or delete one record. Clear the flow when at is absent.
 async function __m_save(r, at, rec) {
   try {
     await r.tools.meguru_save(rec ? { name: r.name, at: at, rec: rec } : { name: r.name, at: at })

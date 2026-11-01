@@ -82,6 +82,18 @@ try {
 	assert.ok(!declared.some((t) => t.name === "meguru_save"), "the save tool is not declared to the model");
 	assert.ok(!declared.find((t) => t.name === "codemode").description.includes("meguru_save"), "codemode does not list the save tool");
 	const later = JSON.stringify(requests.at(-1));
+	for (const messages of requests) {
+		const definitions = messages.filter((m) => m.role === "system").flatMap((m) => m.toolsAdded ?? []);
+		const codemode = definitions.find((t) => t.name === "codemode");
+		assert.ok(codemode, "the request declares codemode");
+		assert.equal(codemode.description.split("Meguru — composable PTC workflows.").length - 1, 1, "each codemode declaration has one flow hint");
+		assert.match(codemode.description, /^Meguru — composable PTC workflows./);
+		assert.match(codemode.description, /ptc\(name, fn\)/);
+		assert.match(codemode.description, /Ordinary codemode scripts still work/);
+		assert.match(codemode.description, /group\(name, fn\)/);
+		assert.match(codemode.description, /node\.map\(items/);
+	}
+	assert.ok(!declared.find((t) => t.name === "codemode").description.includes("Meguru — composable PTC workflows."), "the original tool definition is unchanged");
 	const leaks = {
 		runtimeInSessionFile: file.includes("__m_cur"),
 		runtimeInLaterRequest: later.includes("__m_cur"),

@@ -9,6 +9,18 @@ import { injectFlow, SAVE_TOOL_NAME } from "./inject.mjs";
 
 type Calls = { calls?: { name?: string }[] } | undefined;
 
+const FLOW_HINT = `Meguru — composable PTC workflows. Ordinary codemode scripts still work; no setup needed.
+
+Records are in-memory only; cleared on completion, session changes, or tree navigation.
+
+* ptc(name, fn) creates an async node that accepts JSON arguments and returns JSON. Nodes can batch, chain, and process tool calls, but cannot invoke nodes, groups, or pauses.
+* flow(name, asyncFn, { watch?, fresh? }) composes nodes using ordinary async JavaScript: branches, loops, aggregation, retries, and fallbacks. Inside flows, tools must be called through nodes. Keep orchestration deterministic and side-effect-free; it reruns on continuation.
+* group(name, fn) creates a nested flow with scoped identities. node.map(items, { key }) and group.map(items, { key }) execute sequentially, preserving input order. Unique stable keys preserve identity across reordering.
+* await pause(name) pauses for model judgment. Resubmit the flow to continue. Completed nodes are reused when their identity, source, and JSON arguments match. Pass dependencies explicitly as arguments; closures and external state are not tracked. Use a new pause name for another review, or fresh: true to restart. Rethrow isFlowStop(error) before handling other errors.
+* watch: { key: n => expr } tracks outputs without stopping (n.name, n.all.name). Expressions must be synchronous and side-effect-free.
+
+flow() returns { status, at, reason, trace, value?, error? } with status done, paused, or error. It prints nothing; return a concise result preserving pause/error details. Keep node outputs bounded.`;
+
 // Return the record without the save calls, or the same record when it has none.
 function withoutSaves(record: Calls): Calls {
 	if (!Array.isArray(record?.calls) || !record.calls.some((c) => c.name === SAVE_TOOL_NAME)) return record;
@@ -16,8 +28,16 @@ function withoutSaves(record: Calls): Calls {
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.on("context_with_system", (event) => ({
+		messages: event.messages.map((message) => message.role === "system" && message.toolsAdded
+			? { ...message, toolsAdded: message.toolsAdded.map((tool) => tool.name === "codemode" && !tool.description.includes(FLOW_HINT)
+				? { ...tool, description: `${FLOW_HINT}\n\n${tool.description}` }
+				: tool) }
+			: message),
+	}));
+
 	// Flow name → records. One Pi process has one active session, so the flow name is the key.
-	const saved = new Map<string, unknown[]>();
+	const saved = new Map<string, Record<string, unknown>>();
 	const clear = () => saved.clear();
 	pi.on("session_start", clear);
 	pi.on("session_tree", clear);
@@ -45,17 +65,21 @@ export default function (pi: ExtensionAPI) {
 		description: "Internal checkpoint storage for the pi-meguru flow runtime. Do not call it yourself.",
 		parameters: Type.Object({
 			name: Type.String(),
-			at: Type.Integer({ minimum: 0 }),
+			at: Type.Optional(Type.String()),
 			rec: Type.Optional(Type.Unknown()),
 		}),
 		exposure: "deferred",
 		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 		async execute(_toolCallId, params) {
-			const list = (saved.get(params.name) ?? []).slice(0, params.at);
-			if (params.rec !== undefined) list.push(params.rec);
-			if (list.length) saved.set(params.name, list);
-			else saved.delete(params.name);
-			return { content: [{ type: "text", text: `${list.length} records` }], details: undefined };
+			if (params.at === undefined) saved.delete(params.name);
+			else {
+				const records = saved.get(params.name) ?? Object.create(null);
+				if (params.rec === undefined) delete records[params.at];
+				else records[params.at] = params.rec;
+				if (Object.keys(records).length) saved.set(params.name, records);
+				else saved.delete(params.name);
+			}
+			return { content: [{ type: "text", text: "saved" }], details: undefined };
 		},
 	});
 }

@@ -1,6 +1,6 @@
 {
   "name": "pi-meguru",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Lightweight DAG orchestration for Pi codemode: independent PTC nodes, plain JS orchestration, pause, resume and watch.",
   "license": "MPL-2.0",
   "type": "module",
@@ -18,9 +18,6 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ],
-    "skills": [
-      "./skills"
     ]
   },
   "repository": {
@@ -31,7 +28,6 @@
     "index.ts",
     "inject.mjs",
     "runtime.js",
-    "skills/",
     "example.js",
     "README.zh-CN.md",
     "LICENSE"
